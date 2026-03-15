@@ -14,6 +14,7 @@ from ..services.predict import (
     compute_metrics,
     flatten_signals,
     generate_session_id,
+    get_label_mapping,
     normalize_labels,
 )
 
@@ -47,9 +48,18 @@ async def upload(
             detail=f"Invalid .npz file: {str(e)}",
         )
 
-    true_labels = normalize_labels(test_y)
     signals = flatten_signals(test_x)
 
+    try:
+        mapping = await get_label_mapping()
+        label_to_int = mapping.get("label_to_int")
+    except Exception:
+        label_to_int = None
+
+    try:
+        true_labels = normalize_labels(test_y, label_to_int=label_to_int)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     ml_predictions = await call_ml_predict(signals)
 
     predicted_labels = [p["class_id"] for p in ml_predictions]

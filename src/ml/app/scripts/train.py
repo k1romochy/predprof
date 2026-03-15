@@ -1,6 +1,5 @@
 import json
 import logging
-from collections import Counter
 from pathlib import Path
 
 import h5py
@@ -27,7 +26,7 @@ ARTIFACTS_DIR = BASE_DIR / "artifacts"
 NUM_CLASSES = 20
 NUM_FEATURES = 1600
 BATCH_SIZE = 512
-MAX_EPOCHS = 15
+MAX_EPOCHS = 32
 PATIENCE = 20
 LR = 3e-4
 GRAD_CLIP = 1.0
@@ -221,31 +220,6 @@ def load_model_h5(model: nn.Module, path: Path) -> None:
     model.load_state_dict(state)
 
 
-def save_metrics(history: dict[str, list[float]]) -> None:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    (ARTIFACTS_DIR / "metrics.json").write_text(
-        json.dumps(history, ensure_ascii=False, indent=2),
-    )
-    log.info("Saved metrics.json")
-
-
-def save_class_distribution(
-    train_y_int: np.ndarray,
-    mapping: dict[str, int],
-) -> None:
-    reverse_map = {v: k for k, v in mapping.items()}
-    counts = Counter(train_y_int.tolist())
-    dist = [
-        {"class_id": cid, "label": reverse_map[cid], "count": counts.get(cid, 0)}
-        for cid in range(len(mapping))
-    ]
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    (ARTIFACTS_DIR / "class_distribution.json").write_text(
-        json.dumps(dist, indent=2),
-    )
-    log.info("Saved class_distribution.json")
-
-
 def save_label_mapping(mapping: dict[str, int]) -> None:
     reverse = {v: k for k, v in mapping.items()}
     data = {
@@ -266,54 +240,6 @@ def save_normalization(mean: np.ndarray, std: np.ndarray) -> None:
     log.info("Saved normalization.npz")
 
 
-def evaluate_and_save(
-    model: nn.Module,
-    valid_loader: DataLoader,
-    valid_y_int: np.ndarray,
-    mapping: dict[str, int],
-) -> None:
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    reverse_map = {v: k for k, v in mapping.items()}
-
-    all_preds: list[int] = []
-    loss_sum, total = 0.0, 0
-
-    with torch.no_grad():
-        for xb, yb in valid_loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            logits = model(xb)
-            loss_sum += criterion(logits, yb).item() * xb.size(0)
-            total += xb.size(0)
-            all_preds.extend(logits.argmax(1).cpu().tolist())
-
-    predicted = np.array(all_preds)
-    per_sample_correct = (predicted == valid_y_int).astype(int).tolist()
-    val_acc = float(np.mean(per_sample_correct))
-    val_loss = loss_sum / total
-
-    top5_counts = Counter(valid_y_int.tolist())
-    top5 = dict(sorted(top5_counts.items(), key=lambda kv: -kv[1])[:5])
-
-    result = {
-        "val_accuracy": round(val_acc, 6),
-        "val_loss": round(val_loss, 6),
-        "per_sample_correct": per_sample_correct,
-        "predicted_classes": predicted.tolist(),
-        "true_classes": valid_y_int.tolist(),
-        "top5_valid_classes": {
-            str(cid): {"label": reverse_map[cid], "count": cnt}
-            for cid, cnt in top5.items()
-        },
-    }
-
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    (ARTIFACTS_DIR / "validation_results.json").write_text(
-        json.dumps(result, indent=2),
-    )
-    log.info("Saved validation_results.json (val_acc=%.4f)", val_acc)
-
-
 def main() -> None:
     log.info("Device: %s", DEVICE)
     train_x, train_y_raw, valid_x, valid_y_raw = load_data()
@@ -332,13 +258,10 @@ def main() -> None:
     param_count = sum(p.numel() for p in model.parameters())
     log.info("Model params: %s", f"{param_count:,}")
 
-    history = train_model(model, train_loader, valid_loader, class_weights=class_weights)
+    train_model(model, train_loader, valid_loader, class_weights=class_weights)
 
-    save_metrics(history)
-    save_class_distribution(train_y_int, mapping)
     save_label_mapping(mapping)
     save_normalization(mean, std)
-    evaluate_and_save(model, valid_loader, valid_y_int, mapping)
 
     log.info("Done")
 

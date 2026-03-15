@@ -28,6 +28,18 @@ def load_model() -> None:
         logger.warning("Model files not found — /predict will be unavailable")
 
 
+@app.get("/labels")
+def labels() -> dict:
+    """Return label mapping for backend to convert ground truth labels."""
+    if predictor is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    return {
+        "label_to_int": predictor.label_to_id,
+        "int_to_label": predictor.id_to_label,
+    }
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(

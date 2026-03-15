@@ -8,6 +8,14 @@ import numpy as np
 from ..core.config import settings
 
 
+async def get_label_mapping() -> dict:
+    """Fetch label mapping from ML service."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(f"{settings.ml_service_url}/labels")
+        response.raise_for_status()
+        return response.json()
+
+
 async def call_ml_predict(signals: list[list[float]]) -> list[dict]:
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
@@ -23,12 +31,22 @@ def load_npz(file_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     return data["test_x"], data["test_y"]
 
 
-def normalize_labels(test_y: np.ndarray) -> np.ndarray:
-    if test_y.dtype.kind in ("U", "S", "O"):
-        unique_sorted = sorted(set(test_y.flat))
+def normalize_labels(test_y: np.ndarray, label_to_int: dict[str, int] | None = None) -> np.ndarray:
+    """Convert labels to class_ids. Uses ML mapping if provided."""
+    flat = np.asarray(test_y).flatten()
+    if label_to_int is not None:
+        result = []
+        for v in flat:
+            key = str(v) if not isinstance(v, str) else v
+            if key not in label_to_int:
+                raise ValueError(f"Unknown label '{v}' not in model mapping")
+            result.append(label_to_int[key])
+        return np.array(result, dtype=int)
+    if flat.dtype.kind in ("U", "S", "O"):
+        unique_sorted = sorted(set(flat))
         mapping = {v: i for i, v in enumerate(unique_sorted)}
-        return np.array([mapping[v] for v in test_y.flat], dtype=int)
-    return test_y.astype(int).flatten()
+        return np.array([mapping[v] for v in flat], dtype=int)
+    return flat.astype(int)
 
 
 def flatten_signals(test_x: np.ndarray) -> list[list[float]]:
