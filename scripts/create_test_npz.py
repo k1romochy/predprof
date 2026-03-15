@@ -4,7 +4,6 @@
 import numpy as np
 from pathlib import Path
 
-# Метки из label_mapping.json (20 классов)
 LABELS = [
     "55_Cancri_Bc", "Gliese_", "Gliese_12_b", "Gliese_163_c", "HD_20794_d",
     "HD_216520_c", "HIP_38594_b", "K2-155d", "K2-288Bb", "K2-332b",
@@ -17,10 +16,8 @@ SIGNAL_LENGTH = 80000
 
 np.random.seed(42)
 
-# test_x: (5, 80000, 1) — 5 сэмплов, каждый 80000 float32
 test_x = np.random.randn(NUM_SAMPLES, SIGNAL_LENGTH, 1).astype(np.float32) * 0.1
 
-# test_y: строковые метки (U = unicode, без object — иначе np.load требует allow_pickle)
 test_y = np.array([LABELS[i % len(LABELS)] for i in range(NUM_SAMPLES)], dtype="U")
 
 out_path = Path(__file__).parent.parent / "test_data.npz"
