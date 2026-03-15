@@ -21,6 +21,7 @@ def load_model() -> None:
         predictor = Predictor(
             weights_path=settings.weights_path,
             mapping_path=settings.label_mapping_path,
+            norm_path=settings.normalization_path,
         )
         logger.info("Model loaded successfully")
     except FileNotFoundError:

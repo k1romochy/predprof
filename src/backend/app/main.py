@@ -34,6 +34,10 @@ async def lifespan(_app: FastAPI):
             )
             logger.info("Admin user created")
 
+    from .seed import seed_demo
+    if await seed_demo():
+        logger.info("Demo analytics data seeded for dashboard")
+
     yield
 
     await engine.dispose()

@@ -6,11 +6,11 @@ import h5py
 import numpy as np
 import torch
 
-from .model import SignalCNN
+from .model import SignalClassifier
 
 logger = logging.getLogger(__name__)
 
-SIGNAL_LENGTH = 80000
+NUM_FEATURES = 1600
 
 
 def _load_state_from_h5(path: Path) -> dict[str, torch.Tensor]:
@@ -22,7 +22,12 @@ def _load_state_from_h5(path: Path) -> dict[str, torch.Tensor]:
 
 
 class Predictor:
-    def __init__(self, weights_path: Path, mapping_path: Path) -> None:
+    def __init__(
+        self,
+        weights_path: Path,
+        mapping_path: Path,
+        norm_path: Path | None = None,
+    ) -> None:
         with open(mapping_path) as fh:
             raw = json.load(fh)
 
@@ -32,8 +37,15 @@ class Predictor:
         }
         num_classes = raw.get("num_classes", len(self.label_to_id))
 
+        self._mean: np.ndarray | None = None
+        self._std: np.ndarray | None = None
+        if norm_path and norm_path.exists():
+            norm = np.load(norm_path)
+            self._mean = norm["mean"]
+            self._std = norm["std"]
+
         self._device = torch.device("cpu")
-        self.model = SignalCNN(num_classes=num_classes)
+        self.model = SignalClassifier(num_features=NUM_FEATURES, num_classes=num_classes)
 
         state = _load_state_from_h5(weights_path)
         self.model.load_state_dict(state)
@@ -50,6 +62,14 @@ class Predictor:
         arr = np.array(signals, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
+
+        if arr.shape[1] != NUM_FEATURES:
+            raise ValueError(
+                f"Expected {NUM_FEATURES} features per sample, got {arr.shape[1]}"
+            )
+
+        if self._mean is not None and self._std is not None:
+            arr = (arr - self._mean) / (self._std + 1e-8)
 
         x = torch.from_numpy(arr).unsqueeze(1).to(self._device)
 

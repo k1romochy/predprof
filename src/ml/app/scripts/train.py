@@ -7,8 +7,11 @@ import h5py
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
+
+from ..model import SignalClassifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,12 +25,14 @@ WEIGHTS_DIR = BASE_DIR / "weights"
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
 
 NUM_CLASSES = 20
-BATCH_SIZE = 32
-MAX_EPOCHS = 50
-PATIENCE = 10
-LR = 1e-3
-HEX_PREFIX_LEN = 32
-
+NUM_FEATURES = 1600
+BATCH_SIZE = 512
+MAX_EPOCHS = 15
+PATIENCE = 20
+LR = 3e-4
+GRAD_CLIP = 1.0
+LABEL_SMOOTHING = 0.1
+NOISE_STD = 0.05
 
 def _get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -38,10 +43,6 @@ def _get_device() -> torch.device:
 
 
 DEVICE = _get_device()
-
-
-def extract_planet_name(raw_label: str) -> str:
-    return raw_label[HEX_PREFIX_LEN:] if len(raw_label) > HEX_PREFIX_LEN else raw_label
 
 
 def load_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -56,58 +57,29 @@ def build_label_mapping(
     train_y: np.ndarray,
     valid_y: np.ndarray,
 ) -> dict[str, int]:
-    all_labels = np.concatenate([train_y, valid_y])
-    planet_names = sorted({extract_planet_name(lbl) for lbl in all_labels})
-    mapping = {name: idx for idx, name in enumerate(planet_names)}
+    all_labels = sorted(set(train_y) | set(valid_y))
+    mapping = {name: idx for idx, name in enumerate(all_labels)}
     log.info("Label mapping: %d classes", len(mapping))
     return mapping
 
 
 def encode_labels(raw_y: np.ndarray, mapping: dict[str, int]) -> np.ndarray:
-    return np.array(
-        [mapping[extract_planet_name(lbl)] for lbl in raw_y],
-        dtype=np.int64,
-    )
-
-
-class SignalCNN(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=7, padding=3),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.MaxPool1d(4),
-
-            nn.Conv1d(32, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(4),
-
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.MaxPool1d(4),
-        )
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.features(x))
+    return np.array([mapping[lbl] for lbl in raw_y], dtype=np.int64)
 
 
 def compute_class_weights(y_int: np.ndarray, num_classes: int) -> torch.Tensor:
     counts = np.bincount(y_int, minlength=num_classes).astype(float)
     counts = np.maximum(counts, 1.0)
-    weights = 1.0 / counts
-    weights = weights / weights.sum() * num_classes
-    weights = np.minimum(weights, 5.0)
+    weights = np.sqrt(counts.mean() / counts)
+    weights = np.clip(weights, 0.5, 3.0)
     log.info("Class weights: %s", np.round(weights, 3))
     return torch.from_numpy(weights).float()
+
+
+def normalize(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mean = x.mean(axis=0, keepdims=True)
+    std = x.std(axis=0, keepdims=True) + 1e-8
+    return ((x - mean) / std).astype(np.float32), mean, std
 
 
 def make_loaders(
@@ -115,15 +87,30 @@ def make_loaders(
     train_y_int: np.ndarray,
     valid_x: np.ndarray,
     valid_y_int: np.ndarray,
-) -> tuple[DataLoader, DataLoader]:
-    tx = torch.from_numpy(train_x.squeeze(-1)[:, np.newaxis, :]).float()
+) -> tuple[DataLoader, DataLoader, np.ndarray, np.ndarray]:
+    train_x_norm, mean, std = normalize(train_x)
+    valid_x_norm = ((valid_x - mean) / (std + 1e-8)).astype(np.float32)
+
+    tx = torch.from_numpy(train_x_norm[:, np.newaxis, :]).float()
     ty = torch.from_numpy(train_y_int).long()
-    vx = torch.from_numpy(valid_x.squeeze(-1)[:, np.newaxis, :]).float()
+    vx = torch.from_numpy(valid_x_norm[:, np.newaxis, :]).float()
     vy = torch.from_numpy(valid_y_int).long()
 
-    train_loader = DataLoader(TensorDataset(tx, ty), batch_size=BATCH_SIZE, shuffle=True)
-    valid_loader = DataLoader(TensorDataset(vx, vy), batch_size=BATCH_SIZE)
-    return train_loader, valid_loader
+    use_pin = DEVICE.type == "cuda"
+    train_loader = DataLoader(
+        TensorDataset(tx, ty),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=use_pin,
+    )
+    valid_loader = DataLoader(
+        TensorDataset(vx, vy),
+        batch_size=BATCH_SIZE,
+        num_workers=0,
+        pin_memory=use_pin,
+    )
+    return train_loader, valid_loader, mean, std
 
 
 def train_model(
@@ -133,12 +120,19 @@ def train_model(
     class_weights: torch.Tensor | None = None,
 ) -> dict[str, list[float]]:
     model.to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=LR * 10,
+        epochs=MAX_EPOCHS,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,
+        anneal_strategy="cos",
+    )
 
-    criterion = (
-        nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
-        if class_weights is not None
-        else nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights.to(DEVICE) if class_weights is not None else None,
+        label_smoothing=LABEL_SMOOTHING,
     )
 
     history: dict[str, list[float]] = {
@@ -148,17 +142,21 @@ def train_model(
     patience_counter = 0
 
     for epoch in range(1, MAX_EPOCHS + 1):
-        log.info("── Epoch %02d/%d ──", epoch, MAX_EPOCHS)
+        log.info("── Epoch %02d/%d  lr=%.2e ──", epoch, MAX_EPOCHS, optimizer.param_groups[0]["lr"])
 
         model.train()
         running_loss, correct, total = 0.0, 0, 0
         for xb, yb in tqdm(train_loader, desc=f"  train {epoch}", leave=False):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            if NOISE_STD > 0:
+                xb = xb + torch.randn_like(xb) * NOISE_STD
             optimizer.zero_grad()
             logits = model(xb)
             loss = criterion(logits, yb)
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
+            scheduler.step()
             running_loss += loss.item() * xb.size(0)
             correct += (logits.argmax(1) == yb).sum().item()
             total += xb.size(0)
@@ -179,6 +177,9 @@ def train_model(
         val_loss = val_loss_sum / val_total
         val_acc = val_correct / val_total
 
+        if DEVICE.type == "mps":
+            torch.mps.empty_cache()
+
         history["loss"].append(round(train_loss, 6))
         history["accuracy"].append(round(train_acc, 6))
         history["val_loss"].append(round(val_loss, 6))
@@ -192,15 +193,15 @@ def train_model(
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             patience_counter = 0
-            save_model_h5(model, WEIGHTS_DIR / "best_model.h5")
-            log.info("  ✓ saved best_model.h5 (val_acc=%.4f)", val_acc)
+            save_model_h5(model, WEIGHTS_DIR / "best-model.h5")
+            log.info("  ✓ saved best-model.h5 (val_acc=%.4f)", val_acc)
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
                 log.info("Early stopping at epoch %d", epoch)
                 break
 
-    load_model_h5(model, WEIGHTS_DIR / "best_model.h5")
+    load_model_h5(model, WEIGHTS_DIR / "best-model.h5")
     return history
 
 
@@ -259,6 +260,12 @@ def save_label_mapping(mapping: dict[str, int]) -> None:
     log.info("Saved label_mapping.json")
 
 
+def save_normalization(mean: np.ndarray, std: np.ndarray) -> None:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    np.savez(ARTIFACTS_DIR / "normalization.npz", mean=mean, std=std)
+    log.info("Saved normalization.npz")
+
+
 def evaluate_and_save(
     model: nn.Module,
     valid_loader: DataLoader,
@@ -315,10 +322,13 @@ def main() -> None:
     train_y_int = encode_labels(train_y_raw, mapping)
     valid_y_int = encode_labels(valid_y_raw, mapping)
 
-    class_weights = compute_class_weights(train_y_int, NUM_CLASSES)
-    train_loader, valid_loader = make_loaders(train_x, train_y_int, valid_x, valid_y_int)
+    num_classes = len(mapping)
+    class_weights = compute_class_weights(train_y_int, num_classes)
+    train_loader, valid_loader, mean, std = make_loaders(
+        train_x, train_y_int, valid_x, valid_y_int,
+    )
 
-    model = SignalCNN(num_classes=NUM_CLASSES)
+    model = SignalClassifier(num_features=NUM_FEATURES, num_classes=num_classes)
     param_count = sum(p.numel() for p in model.parameters())
     log.info("Model params: %s", f"{param_count:,}")
 
@@ -327,6 +337,7 @@ def main() -> None:
     save_metrics(history)
     save_class_distribution(train_y_int, mapping)
     save_label_mapping(mapping)
+    save_normalization(mean, std)
     evaluate_and_save(model, valid_loader, valid_y_int, mapping)
 
     log.info("Done")
